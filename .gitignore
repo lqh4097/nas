@@ -1,0 +1,25 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# 数据集（大文件，不纳入版本控制）
+bird_data/
+Mel_Augment_four/
+*.npy
+*.mp3
+*.ogg
+*.wav
+*.flac
+
+# Claude 本地配置
+.claude/
+
+# PPT 项目（二进制文件）
+projects/
+
+# 系统文件
+.DS_Store
+Thumbs.db
