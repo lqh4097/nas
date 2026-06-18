@@ -1,7 +1,7 @@
 import json
+import random
 from pathlib import Path
 
-import numpy as np
 from PIL import Image
 import torch
 from torch.utils.data import Dataset
@@ -23,20 +23,52 @@ def _load_split() -> dict:
     return json.loads((DATA_DIR / "split_index.json").read_text())
 
 
+class SpecAugment:
+    """
+    频谱图专用增强：随机遮挡若干频率行 / 时间列（SpecAugment 思想）。
+    在归一化之后作用于张量 [C,H,W]，遮挡值设为 0（即归一化后的均值）。
+
+    不对频谱图做水平翻转 —— 水平轴是时间轴，翻转等于把鸟鸣倒放，语义错误；
+    也不做垂直翻转 —— 会打乱频率轴。
+    """
+
+    def __init__(self, freq_mask: int = 24, time_mask: int = 24,
+                 n_freq: int = 2, n_time: int = 2, p: float = 0.5):
+        self.freq_mask = freq_mask
+        self.time_mask = time_mask
+        self.n_freq = n_freq
+        self.n_time = n_time
+        self.p = p
+
+    def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
+        if random.random() > self.p:
+            return tensor
+        _, h, w = tensor.shape
+        for _ in range(self.n_freq):
+            f = random.randint(0, self.freq_mask)
+            if f > 0:
+                f0 = random.randint(0, max(0, h - f))
+                tensor[:, f0:f0 + f, :] = 0.0
+        for _ in range(self.n_time):
+            t = random.randint(0, self.time_mask)
+            if t > 0:
+                t0 = random.randint(0, max(0, w - t))
+                tensor[:, :, t0:t0 + t] = 0.0
+        return tensor
+
+
 def _build_transform(split: str, mean: list, std: list) -> transforms.Compose:
     normalize = transforms.Normalize(mean=mean, std=std)
     if split == "train":
         return transforms.Compose([
-            transforms.Resize(224),
-            transforms.RandomHorizontalFlip(),
-            transforms.RandomCrop(224, padding=8),
+            transforms.Resize((224, 224)),
             transforms.ToTensor(),
             normalize,
+            SpecAugment(),
         ])
     else:
         return transforms.Compose([
-            transforms.Resize(224),
-            transforms.CenterCrop(224),
+            transforms.Resize((224, 224)),
             transforms.ToTensor(),
             normalize,
         ])

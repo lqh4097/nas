@@ -1,18 +1,17 @@
 """
 surrogate.py
 ------------
-代理模型：替代完整训练，快速估算架构准确率。
+供 NAS 主循环使用的两个工具：
 
-两阶段工作流：
-  1. proxy_eval(genome)   — 在 10% 训练子集上跑 3 轮（约 30-60s/架构）
-  2. SurrogateModel       — 积累 ≥ MIN_SAMPLES 条记录后，用随机森林预测（<1s/架构）
+  proxy_eval(genome)   — 在 10% 训练子集上训练几轮，返回真实（代理）准确率；
+                         固定随机种子，同一架构两次评估结果一致（可复现）。
+  SurrogateModel       — 随机森林，从已积累的 proxy 样本预测准确率（<1s/架构）。
 
-NAS 主循环调用 smart_eval()，自动切换两种模式。
+本模块不持久化任何状态：样本的积累、缓存、代理拟合频率全部由调用方
+（nsga2_eda.py）管理，保证每次实验从干净状态开始、可复现。
 """
 
-import json
 import time
-from pathlib import Path
 
 import numpy as np
 import torch
@@ -22,17 +21,16 @@ from torch.utils.data import DataLoader, Subset
 
 from dataset import BirdDataset
 from net_builder import build_net
-from search_space import NDIM, decode, genome_to_array
+from search_space import decode
 
 # ── 超参 ──────────────────────────────────────────────────────────────────────
-PROXY_EPOCHS   = 3        # proxy 训练轮数
-PROXY_SUBSET   = 0.10     # 使用 10% 训练数据
-PROXY_BATCH    = 256
-PROXY_LR       = 1e-3
-PROXY_WORKERS  = 8
-MIN_SAMPLES    = 30       # 启用随机森林的最低样本数
-CACHE_PATH     = Path("d:/NAS项目/data/surrogate_cache.json")
-DEVICE         = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+PROXY_EPOCHS  = 3        # proxy 训练轮数
+PROXY_SUBSET  = 0.10     # 使用 10% 训练数据
+PROXY_BATCH   = 256
+PROXY_LR      = 1e-3
+PROXY_WORKERS = 8
+SEED          = 42
+DEVICE        = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 # ── 数据加载（懒加载，只初始化一次）──────────────────────────────────────────────
@@ -45,7 +43,7 @@ def _get_loaders() -> tuple[DataLoader, DataLoader]:
     if _proxy_loader is None:
         train_ds = BirdDataset("train")
         n = len(train_ds)
-        idx = np.random.default_rng(42).choice(n, int(n * PROXY_SUBSET), replace=False)
+        idx = np.random.default_rng(SEED).choice(n, int(n * PROXY_SUBSET), replace=False)
         _proxy_loader = DataLoader(
             Subset(train_ds, idx.tolist()),
             batch_size=PROXY_BATCH, shuffle=True,
@@ -71,11 +69,12 @@ def _val_acc(model: nn.Module, loader: DataLoader) -> float:
     return correct / n
 
 
-def proxy_eval(genome: list[int]) -> tuple[float, float]:
+def proxy_eval(genome: list[int], seed: int = SEED) -> tuple[float, float]:
     """
     在 10% 训练子集上训练 PROXY_EPOCHS 轮，返回 (val_acc, elapsed_seconds)。
-    结果自动写入缓存。
+    固定随机种子 → 权重初始化与训练过程可复现。
     """
+    torch.manual_seed(seed)
     t0 = time.time()
     proxy_loader, val_loader = _get_loaders()
     model = build_net(genome).to(DEVICE)
@@ -92,37 +91,16 @@ def proxy_eval(genome: list[int]) -> tuple[float, float]:
             optimizer.step()
 
     acc = _val_acc(model, val_loader)
-    elapsed = time.time() - t0
-
-    _cache_append(genome, acc)
-    return acc, elapsed
-
-
-# ── 缓存 I/O ───────────────────────────────────────────────────────────────────
-def _load_cache() -> tuple[list[list[int]], list[float]]:
-    if not CACHE_PATH.exists():
-        return [], []
-    data = json.loads(CACHE_PATH.read_text())
-    return data["genomes"], data["accs"]
-
-
-def _cache_append(genome: list[int], acc: float) -> None:
-    genomes, accs = _load_cache()
-    key = str(genome)
-    keys = [str(g) for g in genomes]
-    if key in keys:
-        return  # 已存在，跳过
-    genomes.append(genome)
-    accs.append(acc)
-    CACHE_PATH.parent.mkdir(exist_ok=True)
-    CACHE_PATH.write_text(json.dumps({"genomes": genomes, "accs": accs}, indent=2))
+    return acc, time.time() - t0
 
 
 # ── 随机森林代理模型 ────────────────────────────────────────────────────────────
 class SurrogateModel:
     """
-    输入：16 维整数 genome（可加衍生特征）
+    输入：16 维整数 genome（附加 3 个衍生特征）
     输出：预测 val_acc（回归）
+
+    fit() 由调用方在每代开始时用全部已积累的 proxy 样本调用一次。
     """
 
     def __init__(self, n_estimators: int = 100):
@@ -130,10 +108,10 @@ class SurrogateModel:
             n_estimators=n_estimators,
             max_features="sqrt",
             min_samples_leaf=2,
-            random_state=42,
+            random_state=SEED,
             n_jobs=-1,
         )
-        self._fitted = False
+        self.fitted = False
 
     @staticmethod
     def _features(genomes: list[list[int]]) -> np.ndarray:
@@ -149,50 +127,12 @@ class SurrogateModel:
         return np.array(rows, dtype=np.float32)
 
     def fit(self, genomes: list[list[int]], accs: list[float]) -> None:
-        X = self._features(genomes)
-        y = np.array(accs, dtype=np.float32)
-        self.rf.fit(X, y)
-        self._fitted = True
+        self.rf.fit(self._features(genomes), np.array(accs, dtype=np.float32))
+        self.fitted = True
 
     def predict(self, genomes: list[list[int]]) -> np.ndarray:
-        assert self._fitted, "先调用 fit()"
+        assert self.fitted, "先调用 fit()"
         return self.rf.predict(self._features(genomes))
-
-    def fit_from_cache(self) -> int:
-        """从缓存加载数据并拟合，返回样本数。"""
-        genomes, accs = _load_cache()
-        if len(genomes) >= MIN_SAMPLES:
-            self.fit(genomes, accs)
-        return len(genomes)
-
-
-# ── 智能调度 ───────────────────────────────────────────────────────────────────
-_surrogate = SurrogateModel()
-
-
-def smart_eval(genome: list[int]) -> tuple[float, str]:
-    """
-    自动选择评估方式：
-      - 缓存 < MIN_SAMPLES → proxy_eval（真实训练）
-      - 缓存 ≥ MIN_SAMPLES → 随机森林预测
-
-    返回 (acc, mode)，mode 为 "proxy" 或 "surrogate"。
-    """
-    genomes, accs = _load_cache()
-
-    # 命中缓存直接返回
-    key = str(genome)
-    for g, a in zip(genomes, accs):
-        if str(g) == key:
-            return a, "cache"
-
-    if len(genomes) >= MIN_SAMPLES:
-        _surrogate.fit_from_cache()
-        acc = float(_surrogate.predict([genome])[0])
-        return acc, "surrogate"
-    else:
-        acc, _ = proxy_eval(genome)
-        return acc, "proxy"
 
 
 # ── 快速验证 ───────────────────────────────────────────────────────────────────
@@ -201,13 +141,7 @@ if __name__ == "__main__":
     from search_space import random_genome
 
     print(f"device: {DEVICE}")
-    print(f"缓存路径: {CACHE_PATH}")
-
-    genomes_cached, accs_cached = _load_cache()
-    print(f"已有缓存: {len(genomes_cached)} 条\n")
-
-    rng = random.Random(0)
-    g = random_genome(rng)
+    g = random_genome(random.Random(0))
     print(f"测试 genome: {g}")
     acc, elapsed = proxy_eval(g)
     print(f"proxy_eval → val_acc={acc:.4f}  耗时={elapsed:.1f}s")
