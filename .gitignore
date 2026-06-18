@@ -8,3 +8,6 @@
 !*.ps1
 !src/
 !src/**
+src/__pycache__/
+**/__pycache__/
+*.pyc
