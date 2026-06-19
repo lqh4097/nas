@@ -12,9 +12,11 @@ retrain_pareto.py
 结果写入 results/retrain_result.json，权重存到 checkpoints/pareto/。
 
 用法：
-    python src/retrain_pareto.py
+    python src/retrain_pareto.py                                   # 默认 full/seed42
+    python src/retrain_pareto.py --run-dir results/no-eda/seed1    # 指定某消融组
 """
 
+import argparse
 import json
 import time
 from pathlib import Path
@@ -31,7 +33,7 @@ EPOCHS      = 30
 BATCH_SIZE  = 128
 LR          = 1e-3
 NUM_WORKERS = 8
-RESULT_DIR  = Path("d:/NAS项目/results")
+DEFAULT_RUN_DIR = Path("d:/NAS项目/results/full/seed42")
 CKPT_DIR    = Path("d:/NAS项目/checkpoints/pareto")
 DEVICE      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -62,7 +64,7 @@ def evaluate(model, loader):
     return correct / n
 
 
-def retrain_one(genome: list[int], idx: int,
+def retrain_one(genome: list[int], idx: int, ckpt_dir: Path,
                 train_loader, val_loader, test_loader) -> dict:
     torch.manual_seed(42)
     model = build_net(genome).to(DEVICE)
@@ -86,8 +88,8 @@ def retrain_one(genome: list[int], idx: int,
     model.load_state_dict(best_state)
     test_acc = evaluate(model, test_loader)
 
-    CKPT_DIR.mkdir(parents=True, exist_ok=True)
-    ckpt = CKPT_DIR / f"arch_{idx:02d}.pth"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    ckpt = ckpt_dir / f"arch_{idx:02d}.pth"
     torch.save({"genome": genome, "state_dict": best_state,
                 "val_acc": best_val_acc, "test_acc": test_acc}, ckpt)
 
@@ -101,11 +103,26 @@ def retrain_one(genome: list[int], idx: int,
     }
 
 
+def parse_args():
+    p = argparse.ArgumentParser(description="对 NAS Pareto 前沿架构完整训练 + test 评估")
+    p.add_argument("--run-dir", type=Path, default=DEFAULT_RUN_DIR,
+                   help="NAS 结果目录（含 final_pareto.json），默认 results/full/seed42")
+    return p.parse_args()
+
+
 def main():
-    pareto_path = RESULT_DIR / "final_pareto.json"
+    args = parse_args()
+    run_dir = args.run_dir
+    pareto_path = run_dir / "final_pareto.json"
     assert pareto_path.exists(), f"找不到 {pareto_path}，请先跑 nsga2_eda.py"
     pareto = json.loads(pareto_path.read_text())
+
+    # checkpoint 按组分目录，避免不同消融组互相覆盖
+    run_name = f"{run_dir.parent.name}_{run_dir.name}"   # 如 full_seed42
+    ckpt_dir = CKPT_DIR / run_name
+
     print(f"device: {DEVICE}")
+    print(f"结果目录: {run_dir}")
     print(f"待复训架构数: {len(pareto)}\n")
 
     train_loader = DataLoader(BirdDataset("train"), batch_size=BATCH_SIZE, shuffle=True,
@@ -121,21 +138,21 @@ def main():
         print(f"[{idx+1}/{len(pareto)}] genome={g}  "
               f"(搜索期估计 val_acc={item.get('val_acc')})")
         t0 = time.time()
-        res = retrain_one(g, idx, train_loader, val_loader, test_loader)
+        res = retrain_one(g, idx, ckpt_dir, train_loader, val_loader, test_loader)
         res["search_val_acc"] = item.get("val_acc")
         results.append(res)
         print(f"  → val_acc={res['val_acc']:.4f}  test_acc={res['test_acc']:.4f}  "
               f"params={res['params_M']:.3f}M  耗时 {(time.time()-t0)/60:.1f} min\n")
 
     results.sort(key=lambda r: -r["test_acc"])
-    (RESULT_DIR / "retrain_result.json").write_text(json.dumps(results, indent=2))
+    (run_dir / "retrain_result.json").write_text(json.dumps(results, indent=2))
 
     print("=" * 60)
     print("复训完成（真实指标，按 test_acc 排序）：")
     for r in results:
         print(f"  test_acc={r['test_acc']:.4f}  val_acc={r['val_acc']:.4f}  "
               f"params={r['params_M']:.3f}M  genome={r['genome']}")
-    print(f"\n结果已保存至 {RESULT_DIR}/retrain_result.json")
+    print(f"\n结果已保存至 {run_dir}/retrain_result.json")
 
 
 if __name__ == "__main__":
