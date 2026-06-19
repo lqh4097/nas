@@ -30,7 +30,8 @@ SCRIPT_META = {
     "preprocess.py":            ("数据预处理", DATA / "stats.json"),
     "dataset.py":               ("数据集类（工具模块）", None),
     "baseline_cnn.py":          ("基线：手工 CNN", CKPT / "baseline_cnn_best.pth"),
-    "baseline_mobilenet.py":    ("基线：MobileNetV2 迁移", CKPT / "baseline_mobilenet_best.pth"),
+    "baseline_mobilenet.py":    ("基线：MobileNetV2 0.5× 从零", CKPT / "baseline_mobilenet_best.pth"),
+    "baseline_classic.py":      ("基线：ShuffleNet/MobileNetV3", CKPT / "baseline_mobilenet_v3_small_best.pth"),
     "baseline_random_search.py":("基线：随机搜索", RESULTS / "random_search_result.json"),
     "search_space.py":          ("NAS 搜索空间（工具模块）", None),
     "net_builder.py":           ("基因组→网络（工具模块）", None),
@@ -80,7 +81,7 @@ def ckpt_metrics(path: Path) -> dict | None:
             obj = torch.load(path, map_location="cpu", weights_only=True)
         except Exception:
             obj = torch.load(path, map_location="cpu", weights_only=False)
-        return {k: obj[k] for k in ("val_acc", "test_acc", "epoch") if k in obj}
+        return {k: obj[k] for k in ("val_acc", "test_acc", "epoch", "params_M") if k in obj}
     except Exception as e:
         return {"error": str(e)}
 
@@ -126,18 +127,21 @@ def section_data() -> list[str]:
 def section_results() -> list[str]:
     lines = ["## 三、模型与运行结果", ""]
 
-    # 基线（手工 CNN / MobileNet）
-    lines += ["### 基线模型", "",
-              "| 模型 | Val Acc | 记录轮 | 状态 |",
-              "|------|---------|--------|------|"]
-    for label, fname in [("手工 CNN", "baseline_cnn_best.pth"),
-                         ("MobileNetV2", "baseline_mobilenet_best.pth")]:
+    # 模型基线
+    lines += ["### 模型基线", "",
+              "| 模型 | 参数量(M) | Val Acc | 记录轮 | 状态 |",
+              "|------|-----------|---------|--------|------|"]
+    for label, fname in [("Manual-CNN",          "baseline_cnn_best.pth"),
+                         ("MobileNetV2 0.5×",    "baseline_mobilenet_best.pth"),
+                         ("ShuffleNetV2 0.5×",   "baseline_shufflenet_v2_x0_5_best.pth"),
+                         ("MobileNetV3-Small",   "baseline_mobilenet_v3_small_best.pth")]:
         m = ckpt_metrics(CKPT / fname)
         if m and "val_acc" in m:
-            lines.append(f"| {label} | {m['val_acc']:.4f} | "
+            p = f"{m['params_M']:.3f}" if "params_M" in m else "—"
+            lines.append(f"| {label} | {p} | {m['val_acc']:.4f} | "
                          f"epoch {m.get('epoch','?')} | ✅ |")
         else:
-            lines.append(f"| {label} | — | — | ⬜ 未训练 |")
+            lines.append(f"| {label} | — | — | — | ⬜ 未训练 |")
     lines.append("")
 
     # 随机搜索

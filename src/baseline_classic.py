@@ -1,16 +1,21 @@
 """
-baseline_mobilenet.py
----------------------
-核心基线：MobileNetV2 0.5×（width_mult=0.5），**从零训练**。
+baseline_classic.py
+--------------------
+经典轻量网络基线（torchvision 直接调用），**从零训练**，统一口径。
 
-搜索空间即 MobileNetV2 范式，本基线是最重要的"手工 vs 搜索"同范式对照。
-与 Manual-CNN 同口径：不使用 ImageNet 预训练、SpecAugment、Adam+Cosine、30 epoch，
-保证与 NAS 搜出的架构可比。
+支持：
+    shufflenet_v2_x0_5   异范式（channel shuffle）核心基线
+    mobilenet_v3_small   精度上限参照核心基线
+
+与 Manual-CNN / MobileNetV2 0.5× 同口径：无 ImageNet 预训练、SpecAugment、
+Adam+Cosine、30 epoch，保证与 NAS 搜出的架构可比。
 
 用法：
-    python src/baseline_mobilenet.py
+    python src/baseline_classic.py --model shufflenet_v2_x0_5
+    python src/baseline_classic.py --model mobilenet_v3_small
 """
 
+import argparse
 import time
 from pathlib import Path
 
@@ -23,24 +28,28 @@ from dataset import BirdDataset
 
 # ── 超参 ──────────────────────────────────────────────────────────────────────
 BATCH_SIZE  = 64
-EPOCHS      = 30        # 从零训练，与 Manual-CNN 同口径（非微调的 20）
+EPOCHS      = 30
 LR          = 1e-3
 NUM_WORKERS = 8
-WIDTH_MULT  = 0.5
 CKPT_DIR    = Path("d:/NAS项目/checkpoints")
 DEVICE      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 NUM_CLASSES = 40
 
+MODELS = ("shufflenet_v2_x0_5", "mobilenet_v3_small")
+
 
 # ── 模型 ──────────────────────────────────────────────────────────────────────
-def build_model() -> nn.Module:
-    # 从零初始化（weights=None），0.5× 宽度
-    model = models.mobilenet_v2(weights=None, width_mult=WIDTH_MULT)
-    in_features = model.classifier[1].in_features
-    model.classifier = nn.Sequential(
-        nn.Dropout(0.2),
-        nn.Linear(in_features, NUM_CLASSES),
-    )
+def build_model(name: str) -> nn.Module:
+    """从零初始化指定网络，并把分类头替换为 NUM_CLASSES。"""
+    if name == "shufflenet_v2_x0_5":
+        model = models.shufflenet_v2_x0_5(weights=None)
+        model.fc = nn.Linear(model.fc.in_features, NUM_CLASSES)
+    elif name == "mobilenet_v3_small":
+        model = models.mobilenet_v3_small(weights=None)
+        in_f = model.classifier[-1].in_features
+        model.classifier[-1] = nn.Linear(in_f, NUM_CLASSES)
+    else:
+        raise ValueError(f"未知模型: {name}（可选 {MODELS}）")
     return model
 
 
@@ -77,6 +86,10 @@ def evaluate(model, loader, criterion):
 
 # ── 主流程 ────────────────────────────────────────────────────────────────────
 def main():
+    parser = argparse.ArgumentParser(description="经典轻量网络基线（从零训练）")
+    parser.add_argument("--model", choices=MODELS, required=True)
+    args = parser.parse_args()
+
     CKPT_DIR.mkdir(parents=True, exist_ok=True)
     print(f"device: {DEVICE}")
 
@@ -87,9 +100,9 @@ def main():
     val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False,
                               num_workers=NUM_WORKERS, pin_memory=True)
 
-    model = build_model().to(DEVICE)
+    model = build_model(args.model).to(DEVICE)
     params_M = sum(p.numel() for p in model.parameters()) / 1e6
-    print(f"MobileNetV2 {WIDTH_MULT}×  参数量 = {params_M:.3f}M  (从零训练)")
+    print(f"{args.model}  参数量 = {params_M:.3f}M  (从零训练)")
 
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
@@ -110,13 +123,13 @@ def main():
 
         if va_acc > best_val_acc:
             best_val_acc = va_acc
-            ckpt = CKPT_DIR / "baseline_mobilenet_best.pth"
+            ckpt = CKPT_DIR / f"baseline_{args.model}_best.pth"
             torch.save({"epoch": epoch, "state_dict": model.state_dict(),
                         "val_acc": va_acc, "params_M": params_M,
-                        "width_mult": WIDTH_MULT}, ckpt)
+                        "model": args.model}, ckpt)
             print(f"  → 保存最优模型 val_acc={va_acc:.4f}")
 
-    print(f"\n训练完成，MobileNetV2 {WIDTH_MULT}×  参数量 {params_M:.3f}M  "
+    print(f"\n训练完成，{args.model}  参数量 {params_M:.3f}M  "
           f"最优 val_acc = {best_val_acc:.4f}")
 
 
