@@ -26,7 +26,7 @@ from search_space import decode
 # ── 超参 ──────────────────────────────────────────────────────────────────────
 PROXY_EPOCHS  = 3        # proxy 训练轮数
 PROXY_SUBSET  = 0.10     # 使用 10% 训练数据
-PROXY_BATCH   = 256
+PROXY_BATCH   = 128      # 128 对搜索空间里最大的架构也安全（256 会 OOM）
 PROXY_LR      = 1e-3
 PROXY_WORKERS = 8
 SEED          = 42
@@ -91,7 +91,14 @@ def proxy_eval(genome: list[int], seed: int = SEED) -> tuple[float, float]:
             optimizer.step()
 
     acc = _val_acc(model, val_loader)
-    return acc, time.time() - t0
+    elapsed = time.time() - t0
+
+    # 释放显存：否则循环评估大量架构时会累积导致 OOM
+    del model, optimizer
+    if DEVICE.type == "cuda":
+        torch.cuda.empty_cache()
+
+    return acc, elapsed
 
 
 # ── 随机森林代理模型 ────────────────────────────────────────────────────────────
