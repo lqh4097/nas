@@ -1,33 +1,26 @@
 """
-baseline_classic.py
---------------------
-经典轻量网络基线（torchvision 直接调用），**从零训练**，统一口径。
+baseline_crnn.py
+----------------
+选做基线：Manual-CRNN（3层 CNN + 1层 GRU + FC），**从零训练**。
 
-支持（torchvision）：
-    shufflenet_v2_x0_5   异范式（channel shuffle）核心基线
-    mobilenet_v3_small   精度上限参照核心基线
-支持（timm）：
-    ghostnet_050         异范式（Ghost module）选做基线
-    efficientnet_lite0   异范式（边缘版 EfficientNet）选做基线
+作用：验证"纯 CNN 能否超越 CNN+RNN"。频谱图的水平轴是时间轴——CNN 先提特征，
+沿频率轴(H)平均后把时间轴(W)当作序列喂给 GRU 做时序建模。
 
-与 Manual-CNN / MobileNetV2 0.5× 同口径：无 ImageNet 预训练、SpecAugment、
-Adam+Cosine、30 epoch，保证与 NAS 搜出的架构可比。
+⚠️ 部署 caveat：GRU 在 RK3566 NPU 上常不被支持、回退 CPU，延迟可能很差——
+这恰是支持"纯 CNN 搜索空间"的论据；论文中报告其 RK3566 延迟时须显式标注。
+
+与其它基线同口径：SpecAugment、Adam+Cosine、30 epoch、无预训练。
 
 用法：
-    python src/baseline_classic.py --model shufflenet_v2_x0_5
-    python src/baseline_classic.py --model mobilenet_v3_small
-    python src/baseline_classic.py --model ghostnet_050
-    python src/baseline_classic.py --model efficientnet_lite0
+    python src/baseline_crnn.py
 """
 
-import argparse
 import time
 from pathlib import Path
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from torchvision import models
 
 from dataset import BirdDataset
 
@@ -36,31 +29,30 @@ BATCH_SIZE  = 64
 EPOCHS      = 30
 LR          = 1e-3
 NUM_WORKERS = 8
+GRU_HIDDEN  = 64
 CKPT_DIR    = Path("d:/NAS项目/checkpoints")
 DEVICE      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 NUM_CLASSES = 40
 
-TORCHVISION_MODELS = ("shufflenet_v2_x0_5", "mobilenet_v3_small")
-TIMM_MODELS        = ("ghostnet_050", "efficientnet_lite0")
-MODELS             = TORCHVISION_MODELS + TIMM_MODELS
-
 
 # ── 模型 ──────────────────────────────────────────────────────────────────────
-def build_model(name: str) -> nn.Module:
-    """从零初始化指定网络，并把分类头替换为 NUM_CLASSES。"""
-    if name == "shufflenet_v2_x0_5":
-        model = models.shufflenet_v2_x0_5(weights=None)
-        model.fc = nn.Linear(model.fc.in_features, NUM_CLASSES)
-    elif name == "mobilenet_v3_small":
-        model = models.mobilenet_v3_small(weights=None)
-        in_f = model.classifier[-1].in_features
-        model.classifier[-1] = nn.Linear(in_f, NUM_CLASSES)
-    elif name in TIMM_MODELS:
-        import timm  # 仅 timm 模型需要，惰性导入
-        model = timm.create_model(name, pretrained=False, num_classes=NUM_CLASSES)
-    else:
-        raise ValueError(f"未知模型: {name}（可选 {MODELS}）")
-    return model
+class CRNN(nn.Module):
+    def __init__(self, num_classes: int = NUM_CLASSES, gru_hidden: int = GRU_HIDDEN):
+        super().__init__()
+        self.cnn = nn.Sequential(
+            nn.Conv2d(3, 32, 3, padding=1),  nn.BatchNorm2d(32),  nn.ReLU(inplace=True), nn.MaxPool2d(2),  # 112
+            nn.Conv2d(32, 64, 3, padding=1), nn.BatchNorm2d(64),  nn.ReLU(inplace=True), nn.MaxPool2d(2),  # 56
+            nn.Conv2d(64, 128, 3, padding=1),nn.BatchNorm2d(128), nn.ReLU(inplace=True), nn.MaxPool2d(2),  # 28
+        )
+        self.gru = nn.GRU(input_size=128, hidden_size=gru_hidden, batch_first=True)
+        self.fc  = nn.Linear(gru_hidden, num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.cnn(x)            # [B, 128, 28, 28]
+        x = x.mean(dim=2)          # 沿频率轴(H)平均 → [B, 128, 28]
+        x = x.permute(0, 2, 1)     # [B, 28(时间), 128(特征)]
+        _, h = self.gru(x)         # h: [1, B, gru_hidden]
+        return self.fc(h[-1])      # [B, num_classes]
 
 
 # ── 训练 / 验证 ───────────────────────────────────────────────────────────────
@@ -96,23 +88,17 @@ def evaluate(model, loader, criterion):
 
 # ── 主流程 ────────────────────────────────────────────────────────────────────
 def main():
-    parser = argparse.ArgumentParser(description="经典轻量网络基线（从零训练）")
-    parser.add_argument("--model", choices=MODELS, required=True)
-    args = parser.parse_args()
-
     CKPT_DIR.mkdir(parents=True, exist_ok=True)
     print(f"device: {DEVICE}")
 
-    train_ds = BirdDataset("train")
-    val_ds   = BirdDataset("val")
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
+    train_loader = DataLoader(BirdDataset("train"), batch_size=BATCH_SIZE, shuffle=True,
                               num_workers=NUM_WORKERS, pin_memory=True)
-    val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False,
+    val_loader   = DataLoader(BirdDataset("val"),   batch_size=BATCH_SIZE, shuffle=False,
                               num_workers=NUM_WORKERS, pin_memory=True)
 
-    model = build_model(args.model).to(DEVICE)
+    model = CRNN().to(DEVICE)
     params_M = sum(p.numel() for p in model.parameters()) / 1e6
-    print(f"{args.model}  参数量 = {params_M:.3f}M  (从零训练)")
+    print(f"Manual-CRNN  参数量 = {params_M:.3f}M  (从零训练)")
 
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
@@ -133,14 +119,12 @@ def main():
 
         if va_acc > best_val_acc:
             best_val_acc = va_acc
-            ckpt = CKPT_DIR / f"baseline_{args.model}_best.pth"
+            ckpt = CKPT_DIR / "baseline_crnn_best.pth"
             torch.save({"epoch": epoch, "state_dict": model.state_dict(),
-                        "val_acc": va_acc, "params_M": params_M,
-                        "model": args.model}, ckpt)
+                        "val_acc": va_acc, "params_M": params_M, "model": "crnn"}, ckpt)
             print(f"  → 保存最优模型 val_acc={va_acc:.4f}")
 
-    print(f"\n训练完成，{args.model}  参数量 {params_M:.3f}M  "
-          f"最优 val_acc = {best_val_acc:.4f}")
+    print(f"\n训练完成，Manual-CRNN  参数量 {params_M:.3f}M  最优 val_acc = {best_val_acc:.4f}")
 
 
 if __name__ == "__main__":

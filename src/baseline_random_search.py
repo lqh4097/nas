@@ -13,13 +13,16 @@ baseline_random_search.py
 评估顺序完整保留在 records 中，便于事后画 HV–评估预算曲线。
 
 用法：
-    python src/baseline_random_search.py          # 默认 N_SAMPLES=200
-    python src/baseline_random_search.py 3        # 指定数量（冒烟测试用）
+    python src/baseline_random_search.py                  # 默认 n=200, seed=42
+    python src/baseline_random_search.py --seed 1         # 多次重复（与 NAS ×5 对等）
+    python src/baseline_random_search.py --n 3            # 指定数量（冒烟测试用）
+
+结果按 results/random_search/seed{seed}/ 分目录保存，多 seed 互不覆盖。
 """
 
+import argparse
 import json
 import random
-import sys
 import time
 from pathlib import Path
 
@@ -30,9 +33,8 @@ from search_space import decode, random_genome
 from surrogate import proxy_eval
 
 # ── 超参 ──────────────────────────────────────────────────────────────────────
-N_SAMPLES   = 200       # 随机采样架构数（研究方案：×200）
-SEED        = 42
-RESULT_DIR  = Path("d:/NAS项目/results")
+DEFAULT_N      = 200    # 随机采样架构数（研究方案：×200）
+RESULT_ROOT    = Path("d:/NAS项目/results/random_search")
 PROGRESS_EVERY = 10     # 每评估多少个就落盘一次（防止长时间运行中途丢失）
 
 
@@ -52,29 +54,42 @@ def _pareto_front(records: list[dict]) -> list[dict]:
     return pareto
 
 
-def _save(records: list[dict], final: bool = False) -> None:
-    RESULT_DIR.mkdir(parents=True, exist_ok=True)
+def _save(records: list[dict], run_dir: Path, n_target: int, seed: int,
+          final: bool = False) -> None:
+    run_dir.mkdir(parents=True, exist_ok=True)
     pareto = _pareto_front(records)
     out = {
         "method": "random_search",
+        "seed": seed,
         "n_evaluated": len(records),
-        "n_target": N_SAMPLES,
-        "seed": SEED,
+        "n_target": n_target,
         "pareto_size": len(pareto),
         "pareto_front": pareto,
         "top5_stats": _top5_stats(records),
         "records": records,   # 含评估顺序，可事后画 HV 曲线
     }
     name = "random_search_result.json" if final else "random_search_progress.json"
-    (RESULT_DIR / name).write_text(json.dumps(out, indent=2))
+    (run_dir / name).write_text(json.dumps(out, indent=2))
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="随机搜索基线（支持多 seed 重复）")
+    p.add_argument("--seed", type=int, default=42,
+                   help="随机种子（多次重复时变化，与 NAS ×5 对等）")
+    p.add_argument("--n", type=int, default=DEFAULT_N,
+                   help="采样架构数（冒烟测试可设小）")
+    return p.parse_args()
 
 
 def main():
-    n_samples = int(sys.argv[1]) if len(sys.argv) > 1 else N_SAMPLES
-    rng = random.Random(SEED)
+    args = parse_args()
+    n_samples, seed = args.n, args.seed
+    run_dir = RESULT_ROOT / f"seed{seed}"
+    rng = random.Random(seed)
 
     print("=" * 60)
-    print(f"Random Search  N={n_samples}  seed={SEED}")
+    print(f"Random Search  N={n_samples}  seed={seed}")
+    print(f"  → {run_dir}")
     print("=" * 60 + "\n")
 
     records: list[dict] = []
@@ -106,9 +121,9 @@ def main():
               f"{el:.0f}s  (best={best_so_far:.4f})")
 
         if len(records) % PROGRESS_EVERY == 0:
-            _save(records, final=False)
+            _save(records, run_dir, n_samples, seed, final=False)
 
-    _save(records, final=True)
+    _save(records, run_dir, n_samples, seed, final=True)
 
     # ── 汇总 ──────────────────────────────────────────────────────────────────
     pareto = _pareto_front(records)
@@ -120,7 +135,7 @@ def main():
     for r in pareto:
         print(f"  val_acc={r['val_acc']:.4f}  params={r['params_M']:.3f}M  "
               f"genome={r['genome']}")
-    print(f"\n结果已保存至 {RESULT_DIR}/random_search_result.json")
+    print(f"\n结果已保存至 {run_dir}/random_search_result.json")
 
 
 if __name__ == "__main__":

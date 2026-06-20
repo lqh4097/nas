@@ -301,14 +301,19 @@ def save_generation(gen, population, fitness, acc_cache, cost_cache, run_dir):
     run_dir.mkdir(parents=True, exist_ok=True)
     fronts = fast_non_dominated_sort(fitness)
     pareto = []
+    seen = set()                       # 去重：同一基因组只保留一份
     for i in fronts[0]:
         g = population[i]
-        acc, mode = acc_cache[str(g)]
+        key = str(g)
+        if key in seen:
+            continue
+        seen.add(key)
+        acc, mode = acc_cache[key]
         cfg = decode(g)
         pareto.append({
             "genome": g,
             "val_acc": round(acc, 6),
-            "params_M": round(cost_cache[str(g)], 4),
+            "params_M": round(cost_cache[key], 4),
             "n_stages": cfg.n_stages,
             "mode": mode,
         })
@@ -418,10 +423,15 @@ def main():
     print("最终 Pareto 前沿（val_acc 为 proxy/代理估计，须 retrain_pareto.py 复训）：")
     fronts = fast_non_dominated_sort(fitness)
     final = []
+    seen = set()                       # 去重：避免 retrain 重复训练同一架构
     for i in fronts[0]:
         g = population[i]
-        acc, mode = acc_cache[str(g)]
-        final.append((acc, cost_cache[str(g)], g, mode))
+        key = str(g)
+        if key in seen:
+            continue
+        seen.add(key)
+        acc, mode = acc_cache[key]
+        final.append((acc, cost_cache[key], g, mode))
     final.sort(key=lambda x: -x[0])
     for acc, cost, g, mode in final:
         print(f"  val_acc={acc:.4f}  params={cost:.3f}M  [{mode:9s}]  genome={g}")
