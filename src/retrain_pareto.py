@@ -107,6 +107,8 @@ def parse_args():
     p = argparse.ArgumentParser(description="对 NAS Pareto 前沿架构完整训练 + test 评估")
     p.add_argument("--run-dir", type=Path, default=DEFAULT_RUN_DIR,
                    help="NAS 结果目录（含 final_pareto.json），默认 results/full/seed42")
+    p.add_argument("--indices", type=str, default=None,
+                   help="只复训指定下标（逗号分隔，对应 final_pareto.json 顺序），默认全部")
     return p.parse_args()
 
 
@@ -115,7 +117,14 @@ def main():
     run_dir = args.run_dir
     pareto_path = run_dir / "final_pareto.json"
     assert pareto_path.exists(), f"找不到 {pareto_path}，请先跑 nsga2_eda.py"
-    pareto = json.loads(pareto_path.read_text())
+    pareto_all = json.loads(pareto_path.read_text())
+
+    # 选择要复训的架构（保留原始下标，checkpoint 命名稳定）
+    if args.indices:
+        sel = [int(i) for i in args.indices.split(",")]
+        items = [(i, pareto_all[i]) for i in sel]
+    else:
+        items = list(enumerate(pareto_all))
 
     # checkpoint 按组分目录，避免不同消融组互相覆盖
     run_name = f"{run_dir.parent.name}_{run_dir.name}"   # 如 full_seed42
@@ -123,7 +132,7 @@ def main():
 
     print(f"device: {DEVICE}")
     print(f"结果目录: {run_dir}")
-    print(f"待复训架构数: {len(pareto)}\n")
+    print(f"待复训架构数: {len(items)} / {len(pareto_all)}（前沿总数）\n")
 
     train_loader = DataLoader(BirdDataset("train"), batch_size=BATCH_SIZE, shuffle=True,
                               num_workers=NUM_WORKERS, pin_memory=True)
@@ -133,9 +142,9 @@ def main():
                               num_workers=NUM_WORKERS, pin_memory=True)
 
     results = []
-    for idx, item in enumerate(pareto):
+    for n, (idx, item) in enumerate(items):
         g = item["genome"]
-        print(f"[{idx+1}/{len(pareto)}] genome={g}  "
+        print(f"[{n+1}/{len(items)}] 前沿#{idx} genome={g}  "
               f"(搜索期估计 val_acc={item.get('val_acc')})")
         t0 = time.time()
         res = retrain_one(g, idx, ckpt_dir, train_loader, val_loader, test_loader)
@@ -144,8 +153,16 @@ def main():
         print(f"  → val_acc={res['val_acc']:.4f}  test_acc={res['test_acc']:.4f}  "
               f"params={res['params_M']:.3f}M  耗时 {(time.time()-t0)/60:.1f} min\n")
 
-    results.sort(key=lambda r: -r["test_acc"])
-    (run_dir / "retrain_result.json").write_text(json.dumps(results, indent=2))
+    # 合并进已有结果（部分重训不覆盖其它架构）：按前沿下标 idx 更新
+    out_path = run_dir / "retrain_result.json"
+    by_idx = {}
+    if out_path.exists():
+        for r in json.loads(out_path.read_text()):
+            by_idx[r["idx"]] = r
+    for r in results:
+        by_idx[r["idx"]] = r          # 本次重训的覆盖旧值
+    merged = sorted(by_idx.values(), key=lambda r: -r["test_acc"])
+    out_path.write_text(json.dumps(merged, indent=2))
 
     print("=" * 60)
     print("复训完成（真实指标，按 test_acc 排序）：")

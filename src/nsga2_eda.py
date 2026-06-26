@@ -7,17 +7,23 @@ NSGA-II（多目标进化）+ EDA（从精英学习采样分布）+ 随机森林
   f1 = val_acc              ← proxy_eval 真实评估 / 代理预测
   f2 = -params_M            ← 参数量（越小越好 → 取负）；后续替换为 -latency_ms
 
-消融实验（RQ3，从 Full 留一法）—— 三个可独立关闭的组件：
+消融实验（RQ3，从 Full 留一法）—— 可独立关闭的组件：
   Init      智能初始化：分层（按 n_stages）+ 成本引导（覆盖参数量范围）；关 → 纯随机
   Surrogate 代理：代理预测 + 每代回填校准；                 关 → 每个架构都真实 proxy 评估
   EDA       生成：从精英学边缘分布概率采样；                关 → 交叉 + 变异（标准 GA）
+  CondEDA   条件 EDA（贡献③）：n_stages 门控 + stage 内 (channels,expand) 联合；关 → UMDA
+  SG-EDA    代理引导分布估计（贡献④）：① 用代理预测精度给精英加权（好精英拉分布更狠）；
+            ② 用随机森林 feature_importances_ 给每个基因自适应采样温度（重要基因锐化=利用、
+            次要基因平滑=探索）。关 → 普通计数 EDA（精英等权、温度=1）。
 
   --ablation 选择实验组：
-    full          三者全开（完整方案）
+    full          全开（完整方案）
     no-init       关 Init
     no-surrogate  关 Surrogate
     no-eda        关 EDA
-    baseline      三者全关（标准 NSGA-II）
+    no-condeda    关 CondEDA（退化为 UMDA，仍含 SG-EDA）
+    no-sgeda      关 SG-EDA（退化为普通计数条件 EDA，隔离贡献④）
+    baseline      全关（标准 NSGA-II）
 
 代理策略（surrogate-in-the-loop，持续回填）：
   gen 0   : 整个种群用 proxy_eval 真实评估 → 代理的初始训练集
@@ -45,7 +51,7 @@ from pathlib import Path
 import numpy as np
 
 from net_builder import build_net
-from search_space import DIM_RANGES, decode, random_genome
+from search_space import NDIM, DIM_RANGES, decode, random_genome
 from surrogate import SurrogateModel, proxy_eval
 
 # ── 超参（部分可由命令行覆盖）─────────────────────────────────────────────────
@@ -53,15 +59,22 @@ ELITE_RATIO = 0.5      # 精英比例（用于 EDA 学习 / GA 交配池）
 EDA_SMOOTH  = 1.0      # Laplace 平滑系数（防止概率为 0）
 MUTATE_PROB = 0.1      # 每维随机突变概率（保持多样性）
 N_INFILL    = 3        # 每代用 proxy_eval 真实评估的子代数量（仅 Surrogate 开时生效）
+SG_W_FLOOR  = 0.2      # SG-EDA 质量加权：最差精英仍保留的权重下限（防止过早收敛）
+SG_TAU_MIN  = 0.5      # SG-EDA 重要基因的采样温度（<1 → 锐化分布 / 利用）
+SG_TAU_MAX  = 2.0      # SG-EDA 次要基因的采样温度（>1 → 平滑分布 / 探索）
 RESULT_ROOT = Path("d:/NAS项目/results")
 
-# 五个消融组 → 三个组件开关
+# 消融组 → 组件开关
+#   use_cond_eda: 生成用「条件 EDA」(贡献③，门控+stage内联合) 还是退化为 UMDA(独立边缘)
+#   use_sg_eda  : 「代理引导分布估计」(贡献④，质量加权+特征重要度温度)；需 EDA & Surrogate 同开
 ABLATIONS = {
-    "full":         dict(use_init=True,  use_surrogate=True,  use_eda=True),
-    "no-init":      dict(use_init=False, use_surrogate=True,  use_eda=True),
-    "no-surrogate": dict(use_init=True,  use_surrogate=False, use_eda=True),
-    "no-eda":       dict(use_init=True,  use_surrogate=True,  use_eda=False),
-    "baseline":     dict(use_init=False, use_surrogate=False, use_eda=False),
+    "full":         dict(use_init=True,  use_surrogate=True,  use_eda=True,  use_cond_eda=True,  use_sg_eda=True),
+    "no-init":      dict(use_init=False, use_surrogate=True,  use_eda=True,  use_cond_eda=True,  use_sg_eda=True),
+    "no-surrogate": dict(use_init=True,  use_surrogate=False, use_eda=True,  use_cond_eda=True,  use_sg_eda=False),
+    "no-eda":       dict(use_init=True,  use_surrogate=True,  use_eda=False, use_cond_eda=True,  use_sg_eda=False),
+    "no-condeda":   dict(use_init=True,  use_surrogate=True,  use_eda=True,  use_cond_eda=False, use_sg_eda=True),
+    "no-sgeda":     dict(use_init=True,  use_surrogate=True,  use_eda=True,  use_cond_eda=True,  use_sg_eda=False),
+    "baseline":     dict(use_init=False, use_surrogate=False, use_eda=False, use_cond_eda=False, use_sg_eda=False),
 }
 
 
@@ -192,21 +205,130 @@ def random_init(pop_size: int, rng: random.Random) -> list[list[int]]:
     return [random_genome(rng) for _ in range(pop_size)]
 
 
+# ── SG-EDA（贡献④：代理引导分布估计）的两个标量来源 ─────────────────────────────
+def _elite_weights(accs) -> np.ndarray:
+    """
+    代理质量加权：把精英的（代理预测）精度 min-max 归一到 [SG_W_FLOOR, 1]。
+    好精英对分布贡献更大，最差精英仍保留 SG_W_FLOOR 的权重以维持探索。
+    accs 全相等时退化为等权（返回全 1）。
+    """
+    a = np.asarray(accs, dtype=float)
+    if a.size == 0 or a.max() == a.min():
+        return np.ones(max(a.size, 1))
+    norm = (a - a.min()) / (a.max() - a.min())
+    return SG_W_FLOOR + (1.0 - SG_W_FLOOR) * norm
+
+
+def _gene_temperatures(surrogate) -> np.ndarray | None:
+    """
+    用随机森林 feature_importances_ 给每个基因一个采样温度：
+      重要基因（importance 高）→ τ→SG_TAU_MIN（<1，锐化分布 / 利用）
+      次要基因（importance 低）→ τ→SG_TAU_MAX（>1，平滑分布 / 探索）
+    返回长度 NDIM 的温度数组；代理未拟合或重要度退化时返回 None（→ 全 τ=1）。
+    """
+    if surrogate is None or not surrogate.fitted:
+        return None
+    imp = np.asarray(surrogate.rf.feature_importances_[:NDIM], dtype=float)
+    if imp.size < NDIM or imp.max() == imp.min():
+        return None
+    norm = (imp - imp.min()) / (imp.max() - imp.min())
+    return SG_TAU_MAX - (SG_TAU_MAX - SG_TAU_MIN) * norm
+
+
+def _apply_tau(probs: np.ndarray, tau: float) -> np.ndarray:
+    """温度缩放：p ∝ p^(1/τ)。τ<1 锐化、τ>1 平滑、τ=1 不变。"""
+    if tau is None or tau == 1.0:
+        return probs
+    p = np.power(np.clip(probs, 1e-12, None), 1.0 / tau)
+    return p / p.sum()
+
+
 # ── 生成算子：EDA 概率采样 vs 交叉+变异 ────────────────────────────────────────
-def eda_sample(elite: list[list[int]], n_samples: int, rng: random.Random) -> list[list[int]]:
-    """从精英学每维边缘分布（UMDA），采样 n_samples 个新基因组；Laplace 平滑。"""
+def _marginal(elites, dim, rng, weights=None, tau=1.0) -> int:
+    """
+    对单维度学 Laplace 平滑边缘分布并采样一个值。
+      weights 不为 None 时按精英权重计数（SG-EDA 质量加权）；
+      tau 为该基因的采样温度（SG-EDA 特征重要度温度）。
+    """
+    lo, hi = DIM_RANGES[dim]
+    n = hi - lo + 1
+    counts = np.zeros(n)
+    for k, e in enumerate(elites):
+        counts[e[dim] - lo] += weights[k] if weights is not None else 1.0
+    total = float(weights.sum()) if weights is not None else len(elites)
+    probs = (counts + EDA_SMOOTH) / (total + EDA_SMOOTH * n)
+    probs = _apply_tau(probs, tau)
+    return lo + rng.choices(range(n), weights=probs.tolist())[0]
+
+
+def _joint(elites, da, db, rng, weights=None, tau=1.0) -> tuple[int, int]:
+    """对两维度学联合分布（捕获耦合）并采样一对值；支持质量加权与温度。"""
+    loa, hia = DIM_RANGES[da]
+    lob, hib = DIM_RANGES[db]
+    na, nb = hia - loa + 1, hib - lob + 1
+    counts = np.zeros((na, nb))
+    for k, e in enumerate(elites):
+        counts[e[da] - loa, e[db] - lob] += weights[k] if weights is not None else 1.0
+    flat = (counts + EDA_SMOOTH).flatten()
+    flat = flat / flat.sum()
+    flat = _apply_tau(flat, tau)
+    idx = rng.choices(range(na * nb), weights=flat.tolist())[0]
+    return loa + idx // nb, lob + idx % nb
+
+
+def eda_sample(elite, n_samples, rng, weights=None, taus=None) -> list[list[int]]:
+    """从精英学每维边缘分布（UMDA），采样 n_samples 个；支持 SG-EDA 加权/温度。"""
     offspring = []
     for _ in range(n_samples):
-        genome = []
-        for d, (lo, hi) in enumerate(DIM_RANGES):
-            n_vals = hi - lo + 1
-            counts = np.zeros(n_vals)
-            for g in elite:
-                counts[g[d] - lo] += 1
-            probs = (counts + EDA_SMOOTH) / (len(elite) + EDA_SMOOTH * n_vals)
-            val = lo + rng.choices(range(n_vals), weights=probs.tolist())[0]
-            genome.append(val)
+        genome = [_marginal(elite, d, rng, weights,
+                            taus[d] if taus is not None else 1.0)
+                  for d in range(NDIM)]
         offspring.append(genome)
+    return offspring
+
+
+# ── 条件 EDA（贡献③：门控 + stage 内容量耦合联合分布）───────────────────────────
+def conditional_eda_sample(elite, n_samples, rng,
+                           weights=None, taus=None) -> list[list[int]]:
+    """
+    架构层级条件 EDA（贡献③）。相对 UMDA 的两点改进：
+      ① 门控：stage s 的基因只从「该 stage 生效」的精英里学（s < n_stages），
+         避免用 2-stage 精英的"无效 stage3 基因"污染分布。
+      ② stage 内耦合：对 (channels, expand) 学联合分布（容量耦合），
+         其余 (n_blocks, kernel, se) 用条件边缘。
+    每 stage 5 基因索引：base=1+5s → [n_blocks, channels, kernel, expand, se]。
+    weights/taus 不为 None 时叠加 SG-EDA（贡献④）的质量加权与特征重要度温度。
+    """
+    MIN_CTX = 3
+    offspring = []
+    for _ in range(n_samples):
+        g = [0] * NDIM
+        g[0] = _marginal(elite, 0, rng, weights,
+                         taus[0] if taus is not None else 1.0)   # 门控位 n_stages
+        n_active = g[0] + 2                                       # 0→2 stage, 1→3 stage
+        for s in range(3):
+            base = 1 + 5 * s
+            if s < n_active:
+                idxs = [k for k, e in enumerate(elite) if s < e[0] + 2]  # 门控：该 stage 生效
+                if len(idxs) < MIN_CTX:
+                    idxs = list(range(len(elite)))
+                ctx = [elite[k] for k in idxs]
+                ctx_w = weights[idxs] if weights is not None else None
+                t_ch  = taus[base + 1] if taus is not None else 1.0
+                t_ex  = taus[base + 3] if taus is not None else 1.0
+                t_joint = 0.5 * (t_ch + t_ex)                    # 联合维温度取两基因均值
+                g[base + 1], g[base + 3] = _joint(ctx, base + 1, base + 3, rng, ctx_w, t_joint)
+                g[base + 0] = _marginal(ctx, base + 0, rng, ctx_w,
+                                        taus[base + 0] if taus is not None else 1.0)
+                g[base + 2] = _marginal(ctx, base + 2, rng, ctx_w,
+                                        taus[base + 2] if taus is not None else 1.0)
+                g[base + 4] = _marginal(ctx, base + 4, rng, ctx_w,
+                                        taus[base + 4] if taus is not None else 1.0)
+            else:
+                for off in range(5):              # 非生效 stage：随机填（decode 会忽略）
+                    lo, hi = DIM_RANGES[base + off]
+                    g[base + off] = rng.randint(lo, hi)
+        offspring.append(g)
     return offspring
 
 
@@ -225,10 +347,13 @@ def mutate(genome: list[int], rng: random.Random, prob: float = MUTATE_PROB) -> 
 
 
 def make_offspring(elite: list[list[int]], n: int, rng: random.Random,
-                   use_eda: bool) -> list[list[int]]:
-    """根据是否启用 EDA 选择生成方式。"""
+                   use_eda: bool, use_cond_eda: bool = True,
+                   weights=None, taus=None) -> list[list[int]]:
+    """根据开关选择生成方式：条件 EDA / UMDA / 交叉+变异。
+    weights/taus 不为 None 时启用 SG-EDA（贡献④）的代理质量加权与特征重要度温度。"""
     if use_eda:
-        return [mutate(g, rng) for g in eda_sample(elite, n, rng)]
+        sampler = conditional_eda_sample if use_cond_eda else eda_sample
+        return [mutate(g, rng) for g in sampler(elite, n, rng, weights, taus)]
     # 标准 GA：交叉 + 变异
     offspring = []
     for _ in range(n):
@@ -358,9 +483,13 @@ def main():
 
     print("=" * 64)
     print(f"NAS 主循环  组={args.ablation}  seed={args.seed}  POP={pop_size}  GEN={n_gen}")
+    gen_desc = ("交叉+变异" if not cfg["use_eda"]
+                else "条件EDA" if cfg["use_cond_eda"] else "UMDA(独立边缘)")
+    if cfg["use_eda"]:
+        gen_desc += "+SG引导" if cfg["use_sg_eda"] else "(普通计数)"
     print(f"  Init={'智能' if cfg['use_init'] else '随机'}  "
           f"Surrogate={'开' if cfg['use_surrogate'] else '关(全真实评估)'}  "
-          f"生成={'EDA' if cfg['use_eda'] else '交叉+变异'}")
+          f"生成={gen_desc}")
     print(f"  → {run_dir}")
     print("=" * 64 + "\n")
 
@@ -392,11 +521,20 @@ def main():
 
         # 2. 选精英（NSGA-II）
         n_elite = max(2, int(pop_size * ELITE_RATIO))
-        elite_pop, _ = select_next_population(population, fitness, n_elite)
+        elite_pop, elite_fit = select_next_population(population, fitness, n_elite)
+
+        # 2b. SG-EDA（贡献④）：代理质量加权 + 特征重要度温度（仅 use_sg_eda 开时）
+        if cfg["use_sg_eda"]:
+            weights = _elite_weights(elite_fit[:, 0])      # col0 = val_acc（代理估计）
+            taus    = _gene_temperatures(surrogate)
+        else:
+            weights = taus = None
 
         # 3. 生成子代（EDA 或 交叉+变异）
         n_offspring = pop_size - n_elite
-        offspring = make_offspring(elite_pop, n_offspring, rng, cfg["use_eda"])
+        offspring = make_offspring(elite_pop, n_offspring, rng,
+                                   cfg["use_eda"], cfg["use_cond_eda"],
+                                   weights, taus)
 
         # 4. 评估子代
         n_real = eval_offspring(offspring, surrogate, proxy_genomes, proxy_accs,
