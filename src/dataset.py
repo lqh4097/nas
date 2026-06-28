@@ -57,18 +57,23 @@ class SpecAugment:
         return tensor
 
 
-def _build_transform(split: str, mean: list, std: list) -> transforms.Compose:
+def _build_transform(split: str, mean: list, std: list,
+                     resolution: int = 224) -> transforms.Compose:
     normalize = transforms.Normalize(mean=mean, std=std)
     if split == "train":
+        # SpecAugment 掩码宽度随分辨率等比缩放，保证不同分辨率下增强强度可比
+        scale = resolution / 224
+        spec = SpecAugment(freq_mask=max(1, round(24 * scale)),
+                           time_mask=max(1, round(24 * scale)))
         return transforms.Compose([
-            transforms.Resize((224, 224)),
+            transforms.Resize((resolution, resolution)),
             transforms.ToTensor(),
             normalize,
-            SpecAugment(),
+            spec,
         ])
     else:
         return transforms.Compose([
-            transforms.Resize((224, 224)),
+            transforms.Resize((resolution, resolution)),
             transforms.ToTensor(),
             normalize,
         ])
@@ -77,14 +82,15 @@ def _build_transform(split: str, mean: list, std: list) -> transforms.Compose:
 class BirdDataset(Dataset):
     """
     split: "train" | "val" | "test"
-    返回 (image_tensor [3,224,224], label int)
+    resolution: 输入边长（默认 224）；用于分辨率消融实验
+    返回 (image_tensor [3,res,res], label int)
     """
 
-    def __init__(self, split: str = "train"):
+    def __init__(self, split: str = "train", resolution: int = 224):
         assert split in ("train", "val", "test"), f"unknown split: {split}"
         self.split = split
         mean, std = _load_stats()
-        self.transform = _build_transform(split, mean, std)
+        self.transform = _build_transform(split, mean, std, resolution)
         self.samples: list[tuple[Path, int]] = []
 
         if split == "train":

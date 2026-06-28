@@ -5,7 +5,7 @@ NSGA-II（多目标进化）+ EDA（从精英学习采样分布）+ 随机森林
 
 两个优化目标（均取最大化）：
   f1 = val_acc              ← proxy_eval 真实评估 / 代理预测
-  f2 = -params_M            ← 参数量（越小越好 → 取负）；后续替换为 -latency_ms
+  f2 = -MACs_M              ← 计算量（候选自己的分辨率，越小越好 → 取负）；后续替换为 -latency_ms
 
 消融实验（RQ3，从 Full 留一法）—— 可独立关闭的组件：
   Init      智能初始化：分层（按 n_stages）+ 成本引导（覆盖参数量范围）；关 → 纯随机
@@ -49,6 +49,8 @@ import time
 from pathlib import Path
 
 import numpy as np
+import torch
+import torch.nn as nn
 
 from net_builder import build_net
 from search_space import NDIM, DIM_RANGES, decode, random_genome
@@ -78,11 +80,42 @@ ABLATIONS = {
 }
 
 
-# ── 代价估算（参数量，后续替换为 RKNN 延迟）─────────────────────────────────────
+# ── 代价估算（MACs，感知分辨率；后续替换为 RKNN 真机延迟）──────────────────────────
+def _count_macs(model: nn.Module, resolution: int) -> float:
+    """forward hook 统计 Conv2d/Linear 的 MACs（单位 M），在给定分辨率下。"""
+    macs = 0
+    handles = []
+
+    def conv_hook(m, inp, out):
+        nonlocal macs
+        oc, oh, ow = out.shape[1], out.shape[2], out.shape[3]
+        kh, kw = m.kernel_size
+        macs += oc * oh * ow * (m.in_channels // m.groups) * kh * kw
+
+    def lin_hook(m, inp, out):
+        nonlocal macs
+        macs += m.in_features * m.out_features
+
+    for mod in model.modules():
+        if isinstance(mod, nn.Conv2d):
+            handles.append(mod.register_forward_hook(conv_hook))
+        elif isinstance(mod, nn.Linear):
+            handles.append(mod.register_forward_hook(lin_hook))
+    model.eval()
+    with torch.no_grad():
+        model(torch.zeros(1, 3, resolution, resolution))
+    for h in handles:
+        h.remove()
+    return macs / 1e6
+
+
 def compute_cost(genome: list[int]) -> float:
-    """返回参数量（单位 M），用作硬件代价的代理指标。"""
+    """返回 MACs（单位 M），在候选**自己的分辨率**下计算 —— 比参数量更贴近延迟、
+    且能感知分辨率（参数量不随分辨率变，无法支撑分辨率协同搜索）。
+    板子到位后替换为 RKNN 真机延迟时**仅改本函数**。"""
+    cfg = decode(genome)
     model = build_net(genome)
-    return sum(p.numel() for p in model.parameters()) / 1e6
+    return _count_macs(model, cfg.resolution)
 
 
 # ── NSGA-II ────────────────────────────────────────────────────────────────────
@@ -328,6 +361,8 @@ def conditional_eda_sample(elite, n_samples, rng,
                 for off in range(5):              # 非生效 stage：随机填（decode 会忽略）
                     lo, hi = DIM_RANGES[base + off]
                     g[base + off] = rng.randint(lo, hi)
+        g[16] = _marginal(elite, 16, rng, weights,             # 分辨率（协同搜索）
+                          taus[16] if taus is not None else 1.0)
         offspring.append(g)
     return offspring
 
@@ -374,7 +409,7 @@ def ensure_cost(genome: list[int], cost_cache: dict) -> float:
 
 
 def build_fitness(population, acc_cache, cost_cache) -> np.ndarray:
-    """从缓存组装 fitness [N,2]：col0=val_acc，col1=-params_M。"""
+    """从缓存组装 fitness [N,2]：col0=val_acc，col1=-MACs_M。"""
     fitness = np.zeros((len(population), 2))
     for i, g in enumerate(population):
         acc, _ = acc_cache[str(g)]
@@ -435,10 +470,13 @@ def save_generation(gen, population, fitness, acc_cache, cost_cache, run_dir):
         seen.add(key)
         acc, mode = acc_cache[key]
         cfg = decode(g)
+        params = sum(p.numel() for p in build_net(g).parameters()) / 1e6
         pareto.append({
             "genome": g,
             "val_acc": round(acc, 6),
-            "params_M": round(cost_cache[key], 4),
+            "macs_M": round(cost_cache[key], 2),       # 第二目标
+            "params_M": round(params, 4),              # 参考（不随分辨率变）
+            "resolution": cfg.resolution,
             "n_stages": cfg.n_stages,
             "mode": mode,
         })
@@ -505,7 +543,7 @@ def main():
         acc_cache[str(g)] = (acc, "proxy")
         ensure_cost(g, cost_cache)
         print(f"  [{i+1:>2d}/{pop_size}] acc={acc:.4f} "
-              f"params={cost_cache[str(g)]:.3f}M  {el:.0f}s")
+              f"MACs={cost_cache[str(g)]:.1f}M res={decode(g).resolution}  {el:.0f}s")
     print(f"  warmup 完成，耗时 {(time.time()-t0)/60:.1f} min\n")
     fitness = build_fitness(population, acc_cache, cost_cache)
     save_generation(0, population, fitness, acc_cache, cost_cache, run_dir)
@@ -550,11 +588,11 @@ def main():
 
         # 6. 记录本代 Pareto 前沿
         pareto = save_generation(gen, population, fitness, acc_cache, cost_cache, run_dir)
-        best_acc  = max(p["val_acc"]  for p in pareto)
-        best_cost = min(p["params_M"] for p in pareto)
+        best_acc  = max(p["val_acc"] for p in pareto)
+        best_cost = min(p["macs_M"]  for p in pareto)
         print(f"  proxy样本={len(proxy_genomes)} 本代真实评估={n_real}  "
               f"Pareto={len(pareto)} best_acc={best_acc:.4f} "
-              f"min_params={best_cost:.3f}M  {time.time()-t0:.0f}s\n")
+              f"min_MACs={best_cost:.1f}M  {time.time()-t0:.0f}s\n")
 
     # ── 输出最终 Pareto 前沿 ──────────────────────────────────────────────────
     print("=" * 64)
@@ -572,10 +610,13 @@ def main():
         final.append((acc, cost_cache[key], g, mode))
     final.sort(key=lambda x: -x[0])
     for acc, cost, g, mode in final:
-        print(f"  val_acc={acc:.4f}  params={cost:.3f}M  [{mode:9s}]  genome={g}")
+        print(f"  val_acc={acc:.4f}  MACs={cost:.1f}M  res={decode(g).resolution}  "
+              f"[{mode:9s}]  genome={g}")
 
     (run_dir / "final_pareto.json").write_text(json.dumps(
-        [{"genome": g, "val_acc": round(a, 6), "params_M": round(c, 4), "mode": m}
+        [{"genome": g, "val_acc": round(a, 6), "macs_M": round(c, 2),
+          "params_M": round(sum(p.numel() for p in build_net(g).parameters()) / 1e6, 4),
+          "resolution": decode(g).resolution, "mode": m}
          for a, c, g, m in final], indent=2))
     (run_dir / "proxy_samples.json").write_text(json.dumps(
         {"genomes": proxy_genomes, "accs": proxy_accs}, indent=2))

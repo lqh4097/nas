@@ -21,7 +21,7 @@ from torch.utils.data import DataLoader, Subset
 
 from dataset import BirdDataset
 from net_builder import build_net
-from search_space import decode
+from search_space import decode, NDIM, _RESOLUTIONS
 
 # ── 超参 ──────────────────────────────────────────────────────────────────────
 PROXY_EPOCHS  = 3        # proxy 训练轮数
@@ -33,28 +33,36 @@ SEED          = 42
 DEVICE        = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-# ── 数据加载（懒加载，只初始化一次）──────────────────────────────────────────────
-_proxy_loader: DataLoader | None = None
-_val_loader:   DataLoader | None = None
+# ── 数据加载（按分辨率缓存；分辨率协同搜索时每个候选用自己的分辨率）─────────────────
+_subset_idx: list[int] | None = None          # 10% proxy 子集索引（与分辨率无关，全局固定）
+_loaders_cache: dict[int, tuple[DataLoader, DataLoader]] = {}   # resolution -> (proxy, val)
 
 
-def _get_loaders() -> tuple[DataLoader, DataLoader]:
-    global _proxy_loader, _val_loader
-    if _proxy_loader is None:
-        train_ds = BirdDataset("train")
+def _get_loaders(resolution: int = 224) -> tuple[DataLoader, DataLoader]:
+    """返回该分辨率的 (proxy_loader, val_loader)。
+    proxy 子集索引（选哪些图）全局固定一次、各分辨率共用 → 跨分辨率排序可比；
+    只有 Resize 那一步随分辨率不同。"""
+    global _subset_idx
+    if resolution in _loaders_cache:
+        return _loaders_cache[resolution]
+
+    train_ds = BirdDataset("train", resolution=resolution)
+    if _subset_idx is None:
         n = len(train_ds)
-        idx = np.random.default_rng(SEED).choice(n, int(n * PROXY_SUBSET), replace=False)
-        _proxy_loader = DataLoader(
-            Subset(train_ds, idx.tolist()),
-            batch_size=PROXY_BATCH, shuffle=True,
-            num_workers=PROXY_WORKERS, pin_memory=True,
-        )
-        _val_loader = DataLoader(
-            BirdDataset("val"),
-            batch_size=PROXY_BATCH, shuffle=False,
-            num_workers=PROXY_WORKERS, pin_memory=True,
-        )
-    return _proxy_loader, _val_loader
+        _subset_idx = np.random.default_rng(SEED).choice(
+            n, int(n * PROXY_SUBSET), replace=False).tolist()
+    proxy_loader = DataLoader(
+        Subset(train_ds, _subset_idx),
+        batch_size=PROXY_BATCH, shuffle=True,
+        num_workers=PROXY_WORKERS, pin_memory=True,
+    )
+    val_loader = DataLoader(
+        BirdDataset("val", resolution=resolution),
+        batch_size=PROXY_BATCH, shuffle=False,
+        num_workers=PROXY_WORKERS, pin_memory=True,
+    )
+    _loaders_cache[resolution] = (proxy_loader, val_loader)
+    return _loaders_cache[resolution]
 
 
 # ── proxy 评估 ─────────────────────────────────────────────────────────────────
@@ -76,7 +84,8 @@ def proxy_eval(genome: list[int], seed: int = SEED) -> tuple[float, float]:
     """
     torch.manual_seed(seed)
     t0 = time.time()
-    proxy_loader, val_loader = _get_loaders()
+    resolution = decode(genome).resolution            # 候选自己的分辨率（协同搜索）
+    proxy_loader, val_loader = _get_loaders(resolution)
     model = build_net(genome).to(DEVICE)
     optimizer = torch.optim.Adam(model.parameters(), lr=PROXY_LR)
     criterion = nn.CrossEntropyLoss()
@@ -129,8 +138,12 @@ class SurrogateModel:
                 cfg.n_stages,
                 sum(s.n_blocks for s in cfg.stages),
                 sum(s.out_channels for s in cfg.stages),
+                cfg.resolution,                       # 分辨率作为衍生特征
             ]
-            rows.append(list(g) + extra)
+            gg = list(g)
+            if len(gg) == NDIM - 1:                    # 旧 16 维 → 补分辨率基因（224）
+                gg = gg + [_RESOLUTIONS.index(224)]
+            rows.append(gg + extra)
         return np.array(rows, dtype=np.float32)
 
     def fit(self, genomes: list[list[int]], accs: list[float]) -> None:

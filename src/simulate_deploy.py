@@ -31,13 +31,15 @@ import torch.nn as nn
 
 from dataset import BirdDataset
 from net_builder import build_net
+from search_space import decode
 
 CKPT_DIR = Path("d:/NAS项目/checkpoints/pareto/full_seed42")
 RETRAIN  = Path("d:/NAS项目/results/full/seed42/retrain_result.json")
+DEPLOY_JSON = Path("d:/NAS项目/results/deploy_sim.json")   # 供 project_status.py 读取
 
 
 # ── 计算量（MACs）：forward hook 统计 Conv2d / Linear ────────────────────────────
-def count_macs(model: nn.Module, shape=(1, 3, 224, 224)) -> float:
+def count_macs(model: nn.Module, res: int = 224) -> float:
     macs = 0
     handles = []
 
@@ -58,7 +60,7 @@ def count_macs(model: nn.Module, shape=(1, 3, 224, 224)) -> float:
             handles.append(mod.register_forward_hook(lin_hook))
     model.eval()
     with torch.no_grad():
-        model(torch.zeros(shape))
+        model(torch.zeros(1, 3, res, res))
     for h in handles:
         h.remove()
     return macs / 1e6   # MMACs
@@ -74,10 +76,11 @@ def model_size_mb(model: nn.Module) -> tuple[float, float, int]:
 
 
 @torch.no_grad()
-def cpu_latency_ms(model: nn.Module, runs: int, warmup: int = 5) -> tuple[float, float]:
+def cpu_latency_ms(model: nn.Module, runs: int, res: int = 224,
+                   warmup: int = 5) -> tuple[float, float]:
     """单样本(bs=1) CPU 推理延迟，返回 (mean_ms, p90_ms)。"""
     model.eval()
-    x = torch.zeros(1, 3, 224, 224)
+    x = torch.zeros(1, 3, res, res)
     for _ in range(warmup):
         model(x)
     ts = []
@@ -117,15 +120,27 @@ def main():
         model = build_net(blob["genome"])
         model.load_state_dict(blob["state_dict"])
 
-        macs = count_macs(model)
+        res = blob.get("resolution") or decode(blob["genome"]).resolution
+        macs = count_macs(model, res)
         fp32, int8, n_params = model_size_mb(model)
-        lat_mean, lat_p90 = cpu_latency_ms(model, args.runs)
+        lat_mean, lat_p90 = cpu_latency_ms(model, args.runs, res)
         test_acc = retrain.get(idx, {}).get("test_acc", blob.get("test_acc"))
 
-        rows.append(dict(idx=idx, params_M=n_params / 1e6, macs=macs, fp32=fp32,
-                         int8=int8, lat=lat_mean, p90=lat_p90, acc=test_acc))
+        rows.append(dict(idx=idx, genome=blob["genome"], res=res, params_M=n_params / 1e6,
+                         macs=macs, fp32=fp32, int8=int8,
+                         lat=lat_mean, p90=lat_p90, acc=test_acc))
 
     rows.sort(key=lambda r: r["params_M"])   # 从小到大（部署关心小模型）
+
+    DEPLOY_JSON.parent.mkdir(parents=True, exist_ok=True)
+    DEPLOY_JSON.write_text(json.dumps(
+        [{"idx": r["idx"], "genome": r["genome"],
+          "resolution": r["res"],
+          "params_M": round(r["params_M"], 4), "macs_M": round(r["macs"], 1),
+          "fp32_mb": round(r["fp32"], 3), "int8_mb": round(r["int8"], 4),
+          "cpu_lat_ms": round(r["lat"], 2), "p90_ms": round(r["p90"], 2),
+          "test_acc": r["acc"], "threads": args.threads} for r in rows],
+        indent=2, ensure_ascii=False), encoding="utf-8")
     for r in rows:
         print(f"arch_{r['idx']:02d}{'':<4}{r['params_M']:>8.4f}{r['macs']:>10.1f}"
               f"{r['fp32']:>10.2f}{r['int8']:>10.3f}{r['lat']:>11.2f}{r['p90']:>9.2f}"
@@ -147,7 +162,7 @@ def main():
                       weights_only=False)
     model = build_net(blob["genome"]); model.load_state_dict(blob["state_dict"]); model.eval()
 
-    test_ds = BirdDataset("test")
+    test_ds = BirdDataset("test", resolution=rec["res"])
     rng = np.random.default_rng(42)
     n_show, n_correct = 5, 0
     for k in rng.choice(len(test_ds), n_show, replace=False):

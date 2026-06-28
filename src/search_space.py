@@ -9,8 +9,11 @@ NAS 搜索空间定义：16 维整数编码 ↔ 网络架构描述。
   d6-d10   Stage 2: [n_blocks, channels, kernel, expand, use_se]
   d11-d15  Stage 3: [n_blocks, channels, kernel, expand, use_se]
            (n_stages=2 时 Stage 3 不接入主干，由 net_builder 忽略)
+  d16      全局: resolution ∈ {64,96,128,160,192,224}  ← 输入分辨率协同搜索
 
-搜索空间大小：2 × (3×4×2×2×2)^3 ≈ 177 万
+搜索空间大小：2 × (3×4×2×2×2)^3 × 6 ≈ 1062 万（编码）；去重后 ≈ 536 万有效架构
+
+向后兼容：长度 16 的旧 genome（无分辨率基因）decode 时默认补 224。
 """
 
 import random
@@ -36,15 +39,17 @@ DIM_RANGES = [
     (0, 1),  # d13 s3 kernel
     (0, 1),  # d14 s3 expand
     (0, 1),  # d15 s3 use_se
+    (0, 5),  # d16 resolution（输入分辨率协同搜索）
 ]
 
-NDIM = len(DIM_RANGES)  # 16
+NDIM = len(DIM_RANGES)  # 17
 
 # ── 取值映射表 ─────────────────────────────────────────────────────────────────
-_N_STAGES  = [2, 3]
-_N_BLOCKS  = [1, 2, 3]
-_KERNELS   = [3, 5]
-_EXPANDS   = [3, 6]
+_N_STAGES    = [2, 3]
+_N_BLOCKS    = [1, 2, 3]
+_KERNELS     = [3, 5]
+_EXPANDS     = [3, 6]
+_RESOLUTIONS = [64, 96, 128, 160, 192, 224]
 _CHANNELS  = [
     [16, 24, 32, 48],     # Stage 1（浅层，通道少）
     [32, 48, 64, 96],     # Stage 2
@@ -64,11 +69,12 @@ class StageConfig:
 
 @dataclass
 class ArchConfig:
-    n_stages: int
-    stages:   list[StageConfig]
+    n_stages:   int
+    stages:     list[StageConfig]
+    resolution: int = 224          # 输入分辨率（协同搜索；旧 16 维 genome 默认 224）
 
     def summary(self) -> str:
-        lines = [f"n_stages={self.n_stages}"]
+        lines = [f"n_stages={self.n_stages}  resolution={self.resolution}"]
         for i, s in enumerate(self.stages):
             lines.append(
                 f"  Stage{i+1}: blocks={s.n_blocks} ch={s.out_channels} "
@@ -79,8 +85,11 @@ class ArchConfig:
 
 # ── 核心函数 ───────────────────────────────────────────────────────────────────
 def decode(genome: list[int] | np.ndarray) -> ArchConfig:
-    """16 维整数向量 → ArchConfig（仅包含实际使用的 stages）。"""
+    """17 维整数向量 → ArchConfig（仅包含实际使用的 stages + 输入分辨率）。
+    向后兼容：长度 16 的旧 genome 自动补分辨率基因（默认 224）。"""
     genome = list(genome)
+    if len(genome) == NDIM - 1:                       # 旧 16 维 → 补 224
+        genome = genome + [_RESOLUTIONS.index(224)]
     assert len(genome) == NDIM, f"genome length must be {NDIM}, got {len(genome)}"
     for i, (lo, hi) in enumerate(DIM_RANGES):
         assert lo <= genome[i] <= hi, f"d{i}={genome[i]} out of [{lo},{hi}]"
@@ -96,7 +105,8 @@ def decode(genome: list[int] | np.ndarray) -> ArchConfig:
             expand_ratio = _EXPANDS[genome[b + 3]],
             use_se       = bool(genome[b + 4]),
         ))
-    return ArchConfig(n_stages=n_stages, stages=stages[:n_stages])
+    return ArchConfig(n_stages=n_stages, stages=stages[:n_stages],
+                      resolution=_RESOLUTIONS[genome[16]])
 
 
 def random_genome(rng: random.Random | None = None) -> list[int]:

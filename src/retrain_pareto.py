@@ -27,6 +27,7 @@ from torch.utils.data import DataLoader
 
 from dataset import BirdDataset
 from net_builder import build_net
+from search_space import decode
 
 # ── 超参 ──────────────────────────────────────────────────────────────────────
 EPOCHS      = 30
@@ -64,8 +65,26 @@ def evaluate(model, loader):
     return correct / n
 
 
-def retrain_one(genome: list[int], idx: int, ckpt_dir: Path,
-                train_loader, val_loader, test_loader) -> dict:
+# 数据加载器按分辨率缓存（协同搜索：每个架构在自己的分辨率上训练）
+_LOADERS: dict[int, tuple] = {}
+
+
+def get_loaders(res: int) -> tuple:
+    if res not in _LOADERS:
+        _LOADERS[res] = (
+            DataLoader(BirdDataset("train", resolution=res), batch_size=BATCH_SIZE,
+                       shuffle=True, num_workers=NUM_WORKERS, pin_memory=True),
+            DataLoader(BirdDataset("val", resolution=res), batch_size=BATCH_SIZE,
+                       shuffle=False, num_workers=NUM_WORKERS, pin_memory=True),
+            DataLoader(BirdDataset("test", resolution=res), batch_size=BATCH_SIZE,
+                       shuffle=False, num_workers=NUM_WORKERS, pin_memory=True),
+        )
+    return _LOADERS[res]
+
+
+def retrain_one(genome: list[int], idx: int, ckpt_dir: Path) -> dict:
+    res = decode(genome).resolution
+    train_loader, val_loader, test_loader = get_loaders(res)
     torch.manual_seed(42)
     model = build_net(genome).to(DEVICE)
     params_M = sum(p.numel() for p in model.parameters()) / 1e6
@@ -91,12 +110,14 @@ def retrain_one(genome: list[int], idx: int, ckpt_dir: Path,
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     ckpt = ckpt_dir / f"arch_{idx:02d}.pth"
     torch.save({"genome": genome, "state_dict": best_state,
-                "val_acc": best_val_acc, "test_acc": test_acc}, ckpt)
+                "val_acc": best_val_acc, "test_acc": test_acc,
+                "resolution": res}, ckpt)
 
     return {
         "idx": idx,
         "genome": genome,
         "params_M": round(params_M, 4),
+        "resolution": res,
         "val_acc": round(best_val_acc, 6),
         "test_acc": round(test_acc, 6),
         "ckpt": str(ckpt),
@@ -134,24 +155,18 @@ def main():
     print(f"结果目录: {run_dir}")
     print(f"待复训架构数: {len(items)} / {len(pareto_all)}（前沿总数）\n")
 
-    train_loader = DataLoader(BirdDataset("train"), batch_size=BATCH_SIZE, shuffle=True,
-                              num_workers=NUM_WORKERS, pin_memory=True)
-    val_loader   = DataLoader(BirdDataset("val"),   batch_size=BATCH_SIZE, shuffle=False,
-                              num_workers=NUM_WORKERS, pin_memory=True)
-    test_loader  = DataLoader(BirdDataset("test"),  batch_size=BATCH_SIZE, shuffle=False,
-                              num_workers=NUM_WORKERS, pin_memory=True)
-
     results = []
     for n, (idx, item) in enumerate(items):
         g = item["genome"]
-        print(f"[{n+1}/{len(items)}] 前沿#{idx} genome={g}  "
+        print(f"[{n+1}/{len(items)}] 前沿#{idx} genome={g} res={decode(g).resolution}  "
               f"(搜索期估计 val_acc={item.get('val_acc')})")
         t0 = time.time()
-        res = retrain_one(g, idx, ckpt_dir, train_loader, val_loader, test_loader)
+        res = retrain_one(g, idx, ckpt_dir)
         res["search_val_acc"] = item.get("val_acc")
         results.append(res)
         print(f"  → val_acc={res['val_acc']:.4f}  test_acc={res['test_acc']:.4f}  "
-              f"params={res['params_M']:.3f}M  耗时 {(time.time()-t0)/60:.1f} min\n")
+              f"params={res['params_M']:.3f}M  res={res['resolution']}  "
+              f"耗时 {(time.time()-t0)/60:.1f} min\n")
 
     # 合并进已有结果（部分重训不覆盖其它架构）：按前沿下标 idx 更新
     out_path = run_dir / "retrain_result.json"
